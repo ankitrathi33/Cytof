@@ -1,0 +1,904 @@
+---
+title: "Clustering Analysis of Flow Cytometry Data"
+author: "Ankit Rathi"
+date: "03/08/2020"
+output: 
+   word_document:
+     reference_docx: word-styles-reference-01.docx
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(flowCore)
+library(doParallel)
+library(foreach)
+library(clue)
+library(FlowSOM)
+library(caret)
+
+library(MixGHD)
+library(aricode)
+library(DepecheR)
+
+library(Rtsne)
+library(ggplot2)
+library(tidyverse)
+library(knitr)
+
+helper_eval <- function(clus_truth, clus_algorithm) {
+  tbl_algorithm_comb <- lapply(clus_algorithm, FUN = table)
+  tbl_truth_comb <- lapply(clus_truth, FUN = table)
+  
+  #scores
+  scores <- matrix(0, nrow = 7, ncol = 4)
+  
+  if (length(clus_algorithm) != length(clus_truth)) warning("lengths are not equal")
+  
+  for (s in c(1:length(clus_algorithm))) {
+    tbl_algorithm <- tbl_algorithm_comb[[s]]
+    tbl_truth <- tbl_truth_comb[[s]]
+    pr_mat <- re_mat <- F1_mat <- matrix( NA, 
+                                          nrow = length(tbl_algorithm), 
+                                          ncol = length(tbl_truth))
+    for (i in 1:length(tbl_algorithm)) {
+      for (j in 1:length(tbl_truth)) {
+        # cluster number from algorithm:
+        i_int <- as.integer(names(tbl_algorithm))[i]  
+        # cluster number from true labels:
+        j_int <- as.integer(names(tbl_truth))[j]  
+        
+        true_positives <- 
+          sum(clus_algorithm[[s]] == i_int & clus_truth[[s]] == j_int,
+              na.rm = TRUE)
+        detected <- sum(clus_algorithm[[s]] == i_int, na.rm = TRUE)
+        truth <- sum(clus_truth[[s]] == j_int, na.rm = TRUE)
+        
+        # calculate precision, recall, and F1 score
+        precision_ij <- true_positives / detected
+        recall_ij <- true_positives / truth
+        F1_ij <- 2 * (precision_ij * recall_ij) / (precision_ij + recall_ij)
+        
+        if (F1_ij == "NaN") F1_ij <- 0
+        
+        pr_mat[i, j] <- precision_ij
+        re_mat[i, j] <- recall_ij
+        F1_mat[i, j] <- F1_ij
+      }
+    }
+    
+    rownames(pr_mat) <- rownames(re_mat) <- rownames(F1_mat) <- names(tbl_algorithm)
+    colnames(pr_mat) <- colnames(re_mat) <- colnames(F1_mat) <- names(tbl_truth)
+    
+    # match labels using Hungarian algorithm applied to matrix of F1 scores
+    #(Hungarian algorithm calculates an optimal one-to-one assignment)
+    
+    # use transpose matrix (Hungarian algorithm assumes n_rows <= n_cols)
+    F1_mat_trans <- t(F1_mat)
+    
+    if (nrow(F1_mat_trans) <= ncol(F1_mat_trans)) {
+      # if fewer (or equal no.) true populations than detected clusters, can match all true populations
+      labels_matched <- clue::solve_LSAP(F1_mat_trans, maximum = TRUE)
+      # use row and column names since some labels may have been removed due to unassigned cells
+      labels_matched <-
+        as.numeric(colnames(F1_mat_trans)[as.numeric(labels_matched)])
+      names(labels_matched) <- rownames(F1_mat_trans)
+      
+    } else {
+      # if fewer detected clusters than true populations, use transpose matrix 
+      # and assign NAs for true populations without any matching clusters
+      labels_matched_flipped <- clue::solve_LSAP(F1_mat, maximum = TRUE)
+      # use row and column names since some labels may have been removed due to unassigned cells
+      labels_matched_flipped <-
+        as.numeric(rownames(F1_mat_trans)[as.numeric(labels_matched_flipped)])
+      names(labels_matched_flipped) <- rownames(F1_mat)
+      
+      labels_matched <- rep(NA, ncol(F1_mat))
+      names(labels_matched) <- rownames(F1_mat_trans)
+      labels_matched[as.character(labels_matched_flipped)] <-
+        as.numeric(names(labels_matched_flipped))
+    }
+    
+    # precision, recall, F1 score, and number of cells for each matched cluster
+    pr <- re <- F1 <- n_cells_matched <- rep(NA, ncol(F1_mat))
+    names(pr) <- names(re) <- names(F1) <- names(n_cells_matched) <-
+      names(labels_matched)
+    
+    for (i in 1:ncol(F1_mat)) {
+      # set to 0 if no matching cluster (too few detected clusters)
+      # use character names for row and column indices in case subsampling completely removes some clusters
+      pr[i] <- ifelse(is.na(labels_matched[i]), 
+                      0, 
+                      pr_mat[as.character(labels_matched[i]),
+                             names(labels_matched)[i]])
+      re[i] <- ifelse(is.na(labels_matched[i]),
+                      0,
+                      re_mat[as.character(labels_matched[i]),
+                             names(labels_matched)[i]])
+      F1[i] <- ifelse(is.na(labels_matched[i]),
+                      0,
+                      F1_mat[as.character(labels_matched[i]),
+                             names(labels_matched)[i]])
+      
+      n_cells_matched[i] <- sum(clus_algorithm[[s]] == labels_matched[i],
+                                na.rm = TRUE)
+    }
+    
+    # means across populations
+    scores[s,] <- c(s, mean(pr),mean(re),mean(F1))
+    
+  }
+  colnames(scores) <- c("Sample","Precision","Recall", "F1")
+  return(as.data.frame(scores))
+}
+
+```
+
+## Libraries used:
+
+```{r, eval=FALSE}
+library(doParallel)
+library(foreach)
+
+library(flowCore)
+library(FlowSOM)
+library(flowMeans)
+
+library(clue)
+library(caret)
+library(MixGHD)
+library(aricode)
+
+library(Rtsne)
+library(tidyverse)
+```
+
+## Combine, Transform and Save Data: (one time)
+
+There are 7 samples in total each with a Healthy and a TB marked data. From the Mass Cytometry, data is generally highly skewed. When reading the FCS data using the `read.FCS` from `flowCore` package, it by default performs transformation. But that would be file specific, as each file is read separately. So it is required to first read all files without transformation and then later arcsinh transformation can be applied on together that would scale data equally.
+
+```{r ,eval=FALSE}
+#extract filenames of all fcs files starting with 'Sample' and has '_' in current directory.
+fcsFiles=list.files(pattern="^Sample._.+\\b.fcs") 
+
+#1 Some files have ‘sampleID’ column and some don’t, so to process them accordingly:
+samplID <- c(1, 2, 2, 1, 1, 2, 2) #1 = sampleID present, 2 =  not present
+marker_cols <- c(1:17,19:39,41:51) #When SampleID is present
+marker_cols2 <- c(1:17,19:50) #When SampleID is NOT present
+mrkrs <- list(marker_cols, marker_cols2)
+#mrkrs[1] will give column numbers for datasets having `SampleID` column and mrkrs[2] otherwise
+
+label <- c("Healthy","TB") #to be used to map Healthy as 1 TB as 2
+datas <- list() #to store all samples data
+
+#All file name should be of format "Sample{i}_{Healthy/TB}_UNS
+#Sample6 file name had extra space in name, corrected it manually
+
+for (i in c(0:6)){
+  #extract sample number
+  samp <- strsplit(fcsFiles[2*i+1], "_", fixed=TRUE)[[1]][1] 
+  
+  #extract label names from Healthy and TB files of current samp
+  cluster <- strsplit(fcsFiles[2*i+1], "_", fixed=TRUE)[[1]][2] 
+  cluster2<- strsplit(fcsFiles[2*i+2], "_", fixed=TRUE)[[1]][2] 
+  
+  #read both FCS files:
+  test <- as.data.frame(exprs(read.FCS(fcsFiles[2*i+1], 
+                                       transformation = FALSE,
+                                       truncate_max_range = FALSE)))
+  test2 <- as.data.frame(exprs(read.FCS(fcsFiles[2*i+2], 
+                                        transformation = FALSE,
+                                        truncate_max_range = FALSE)))
+  
+  #add a label column:
+  test$label <- rep(which(label == cluster),nrow(test))
+  test2$label <- rep(which(label == cluster2),nrow(test2))
+  
+  #combine data from both into one: 
+  combined_data <- rbind(test, test2)
+  
+  #Sinh Transformation on only those columns, which are numeric:
+  combined_data[,mrkrs[[samplID[i+1]]]] <- asinh(combined_data[,mrkrs[[samplID[i+1]]]]/5) 
+  
+  #store transformed data in datas list
+  datas[[i+1]] <- combined_data
+  
+  #Storing combined data of each sample in FCS format with name 'SampleX.fcs':
+  write.FCS(flowFrame(exprs=as.matrix(combined_data)),
+            paste(samp,".fcs", sep = ""))
+}
+```
+
+## Read transformed data
+
+```{r }
+#extract filenames of all fcs files having format 'SampleX.fcs' where X is a number
+fcsFiles2=list.files(pattern="^Sample[0-9]\\b.fcs") 
+
+datas <- vector("list", length(fcsFiles2))
+names(datas) <- fcsFiles2
+
+for (i in c(1:7)) {
+  datas[[i]] <- read.FCS(fcsFiles2[i],
+                   transformation = FALSE,
+                   truncate_max_range = FALSE)
+}
+
+#True Labels
+clus_truth <- lapply(datas, function(x) {exprs(x)[,"label"]})
+
+#1 Some files have ‘sampleID’ column and some don’t, so to process them accordingly:
+samplID <- c(1, 2, 2, 1, 1, 2, 2) #1 = sampleID present, 2 =  not present
+marker_cols <- c(1:17,19:39,41:51) #When SampleID is present
+marker_cols2 <- c(1:17,19:50) #When SampleID is NOT present
+mrkrs <- list(marker_cols, marker_cols2)
+#mrkrs[1] will give column numbers for datasets having `SampleID` column and mrkrs[2] otherwise
+```
+
+## k-Means:
+
+k-means with 40 clusters on all 7 samples.
+
+```{r, eval=FALSE}
+registerDoParallel(detectCores()-2) #Setup for parallelizing the process
+kmeans_int <- foreach(i = 1:7,
+                   .combine='list',
+                   .multicombine=TRUE,
+                   .packages = c("flowCore")) %dopar% {
+                     data <- exprs(datas[[i]]) #converting flowFrame into matrix
+                     start <- Sys.time()
+                     out <- kmeans(
+                       data[, mrkrs[[samplID[i]]]],
+                       algorithm = "MacQueen",
+                       centers = 40, #find 40 cluster
+                       nstart = 20, #multiple starting points to reach global optimum
+                       iter.max = 500 #large iterations to reach convergence
+                     )
+                     end <- Sys.time()
+                     time <- difftime(end, start, units = "mins")
+                     list(out,time)
+                   }
+stopImplicitCluster()
+```
+
+```{r, eval=FALSE, include=FALSE}
+save("kmeans_int", file = "kmeans.Rdata") 
+```
+
+```{r, echo=FALSE, include=FALSE}
+load("kmeans.Rdata")
+```
+
+### Evaluation of results from k-means:
+
+Using the F1 score (harmonic mean of precision and recall) as main evaluation criterion. The F1 score provides a value between 0 and 1 for each cluster, with 1 indicating a perfect reproduction of the corresponding manually gated population. High precision implies a low proportion of false positives, and high recall (sensitivity) implies low false negatives. See [appendix](#Appendix) for the helper function `helper_eval` code implementation which uses Hungarian algorithm to evaluate scores. It takes two arguments, a list of true labels & predicted labels for all samples.
+
+```{r}
+clus_kmeans <- lapply(kmeans_int, function(x){x[[1]]$cluster}) #extract predicted labels
+
+scores_kmeans <- helper_eval(clus_truth, clus_kmeans)
+knitr::kable(scores_kmeans)
+```
+
+## Depeche:
+
+k-means clustering does not penalize penalize its output for higher number of clusters. Depeche performs optimizations based on level of penalization. DEPECHE has an observable phenomenon that differentiates it from other tools. But due to penaliation DEPECHE tends to underestimate the number of clusters and gives better precision when the number of manual labels are small. DEPECHE tends to group cells into major cell types hence it is not suitable for analyzing refined subtypes.
+
+```{r, eval=FALSE}
+registerDoParallel(detectCores()-1) #Setup for parallelizing the process
+depeche_int <- list()
+for (i in c(1:7)) {
+  data = exprs(datas[[i]]) #converting flowFrame into matrix
+  start_dep <- Sys.time()
+  testDataDepeche <- depeche(data[, mrkrs[[samplID[i]]]])
+  end_dep <- Sys.time()
+  depeche_int[[i]] <- list(testDataDepeche, end_dep - start_dep)
+}
+stopImplicitCluster()
+```
+
+```{r, eval=FALSE, include=FALSE}
+save("depeche_int", file = "depecheR_new.RData") 
+```
+
+```{r, echo=FALSE}
+load("depecheR_new.RData")
+```
+
+### Evaluate depche:
+
+```{r}
+#Number of clusters it selected in each sample:
+lapply(depeche_int, function(x){length(unique(x[[1]]$clusterVector))})
+
+#extract predicted labels
+clus_depeche <- lapply(depeche_int, function(x){x[[1]]$clusterVector}) 
+
+scores_depeche <- helper_eval(clus_truth, clus_depeche)
+knitr::kable(scores_depeche)
+```
+
+## flowMeans:
+
+Unlike traditional K-means, flowMeans can identify concave cell populations by modelling a single population with multiple clusters. flowMeans uses a change point detection algorithm to determine the number of sub-populations, enabling the method to be used in high throughput FCM data analysis pipelines. By default `flowMeans` command from `flowMeans` package uses default k-means algorithm which gives `Quick-TRANSfer stage steps exceeded maximum` error because of large size of data. Hence modified the `flowMeans` program to include MacQueen k-means algorithm (Source available in [appendix](#flowMeansMy)) with manually selected number of clusters = 40.  
+
+```{r, eval=FALSE}
+registerDoParallel(detectCores()-1)
+
+#loading internally defined function from flowMeans package:
+helpers <- list.files(path = "flowMeans/")
+for (helper in helpers) {
+  source(paste("flowMeans/",helper, sep = ""))
+}
+
+flowmeans_int = foreach(
+  i = 1:7,
+  .combine = list,
+  .multicombine = TRUE,
+  .packages = c("cytofCore", "flowMeans")
+) %dopar% {
+  data = exprs(datas[[i]])
+  start = Sys.time()
+  out = flowmeansMy(data[,mrkrs[[samplID[i]]]], 
+                    Standardize = FALSE,
+                    MaxN = 40, #Maximum number of clusters
+                    iter.max = 500, #large iterations to reach convergence
+                    NumC = 40) #Number of clusters
+  end = Sys.time()
+  time = difftime(end, start, units = "secs")
+  int = data.frame(
+    cluster = out@Label,
+    label = as.integer(data[, "label"])
+  )
+  colnames(int)[1] = "cluster_algo"
+  colnames(int)[2] = "truth"
+  list(int, time)
+}  
+stopImplicitCluster()
+```
+
+```{r, eval=FALSE, include=FALSE}
+save("flowmeans_int", file = "flowMeans.RData") 
+```
+
+```{r, echo=FALSE}
+load("flowMeans.RData")
+```
+
+### Evaluate flowMeans:
+
+```{r}
+#Extract cluster labels for each sample:
+clus_flowmeans <- lapply(flowmeans_int,
+                         function(x) {
+                           x[[1]][, "cluster_algo"]
+                         })
+
+scores_flowMeans <- helper_eval(clus_truth, clus_flowmeans)
+knitr::kable(scores_flowMeans)
+```
+
+## FlowSOM:
+
+FlowSOM is an algorithm that speeds time to analysis and quality of clustering with Self-Organizing Maps (SOMs), nodes of SOM are connected by minimal spanning tree on which a consensus hierarchical meta-clustering can be performed. It can reveal how all markers are behaving on all cells, and can detect subsets that might otherwise be missed. It clusters cells (or other observations) based on chosen clustering channels (or markers/features), generates a SOM of clusters, produces a Minimum Spanning Tree (MST) of the clusters, and assigns each cluster to a metacluster, effectively grouping them into a population. By default it clusters data into a 10 x 10 grid, i.e. total 100 clusters. These clusters can be further combined using Meta clustering to reach required number of clusters. The FlowSOM algorithm outputs SOMs and MSTs showing population abundances and marker expression, but it should be noted that outputs can differ on each run unless same seed is used.
+
+### Run default 10 x 10 grid FlowSOM:
+
+```{r, eval=FALSE}
+registerDoParallel(detectCores()-1) #Setup for parallelizing the process
+seed <- 1000 #to reproduce same analysis
+
+#automatic number of clusters from FlowSOM with default grid of 10 x 10 i.e 100 clusters
+def_res_flowsom <- foreach(i = 1:7,
+                   .combine='list',
+                   .multicombine=TRUE,
+                   .packages=c("flowCore","FlowSOM")) %dopar% {
+                     set.seed(seed = seed)
+                     start <- Sys.time()
+                     fSOM <- ReadInput(datas[[i]], transform = FALSE, scale = FALSE)
+                     fSOM <- BuildSOM(fSOM, colsToUse = mrkrs[[samplID[i]]])
+                     fSOM <- BuildMST(fSOM)
+                     end <- Sys.time()
+                     list(fSOM, end - start)
+                   }
+stopImplicitCluster()
+
+#Cluster Result from default flowSOM:
+clus_100 <- lapply(def_res_flowsom, function(x) {x[[1]]$map$mapping[, 1]})
+names(clus_100) <- names(datas)
+```
+
+### Run Meta-Clustering on default FlowSOM result: 
+
+```{r, eval=FALSE}
+#Run FlowSOM (additional meta-clustering step): automatic number of clusters 
+auto_res_flowsom <- vector("list", length(def_res_flowsom))
+
+registerDoParallel(detectCores() - 1)
+auto_res_flowsom <- foreach(
+  i = 1:length(def_res_flowsom),
+  .combine = 'list',
+  .packages = c("FlowSOM", "flowCore"),
+  .multicombine = TRUE) %dopar% {
+    set.seed(seed)
+    start <- Sys.time()
+    meta <- MetaClustering(def_res_flowsom[[i]][[1]]$map$codes,
+                          method = "metaClustering_consensus",
+                          max = 40) #Meta Clustering will try to find best number of cluster less than 40
+    end <- Sys.time()
+    list(meta, end-start)
+  }
+stopImplicitCluster()
+
+#Re-indexing the cluster labels according to results from auto meta clustering
+clus_auto <- vector("list", length(datas))
+names(clus_auto) <- names(datas)
+for (i in c(1:length(def_res_flowsom))) {
+  clus_auto[[i]] <- auto_res_flowsom[[i]][[1]][clus_100[[i]]]
+}
+
+#Run FlowSOM (additional meta-clustering step): manually selected number of clusters
+fixed_res_flowsom <- vector("list", length(def_res_flowsom))
+
+registerDoParallel(detectCores() - 1)
+fixed_res_flowsom <- foreach(
+  i = 1:length(def_res_flowsom),
+  .combine = 'list',
+  .packages = c("FlowSOM"),
+  .multicombine = TRUE) %dopar% {
+    start <- Sys.time()
+    meta <- metaClustering_consensus(def_res_flowsom[[i]][[1]]$map$codes,
+                                     k = 40, #Fix number of clusters to 40
+                                     seed = seed)
+    end <- Sys.time()
+    list(meta, end-start)
+  }
+stopImplicitCluster()
+
+#Re-indexing the cluster labels according to results from fixed meta clustering
+clus_fixed <- vector("list", length(datas))
+names(clus_fixed) <- names(datas)
+for (i in c(1:length(def_res_flowsom))) {
+  clus_fixed[[i]] <- fixed_res_flowsom[[i]][[1]][clus_100[[i]]]
+}
+```
+```{r, eval=FALSE, include=FALSE}
+save(list= c("auto_res_flowsom", "clus_100", "clus_auto", "clus_fixed", "def_res_flowsom", "fixed_res_flowsom"),
+     file = "flowSOM.RData") 
+```
+
+```{r, echo=FALSE}
+load("flowSOM.RData")
+```
+
+### Evaluation of flowSOM results:
+
+```{r}
+#Results from Default 10 x 10 grid flowSOM:
+scores_flowSOM_def <- helper_eval(clus_truth = clus_truth,
+                                  clus_algorithm = clus_100)
+knitr::kable(scores_flowSOM_def)
+
+#Results from Automatic Meta-Clustering on flowSOM:
+scores_flowSOM_auto <- helper_eval(clus_truth = clus_truth,
+                                   clus_algorithm = clus_auto)
+knitr::kable(scores_flowSOM_auto)
+
+#Results from Fixed Meta-Clustering on flowSOM:
+scores_flowSOM_40 <- helper_eval(clus_truth = clus_truth,
+                                 clus_algorithm = clus_fixed)
+knitr::kable(scores_flowSOM_40)
+```
+
+## Visualizing clusters using Rtsne:
+
+Rtsne is an R implementation of the popular t-SNE algorithm (see [t-SNE algorithm page](https://lvdmaaten.github.io/tsne/)).
+
+The t-SNE algorithm projects high-dimensional data to 2 or 3 dimensions for visualization. This is conceptually similar to principal component analysis (PCA). However, the t-SNE algorithm is non-linear (while PCA is linear), making t-SNE much better suited for many types of biological data.
+
+On a t-SNE plot of flow or mass cytometry data, points "near" to each other can be interpreted as belonging to the same or similar cell populations. However, the precise distances in the plot are not meaningful, so care should be taken not to over-interpret the plot. The algorithm also has a random start, so unless a random seed is used (as in this example), each run will look slightly different.
+
+```{r, eval=FALSE, include=FALSE}
+save(list= c("ix", "labels", "out_rtsne"),
+     file = "rtsne.RData") 
+```
+
+```{r, echo=FALSE}
+load("rtsne.RData")
+```
+
+```{r, eval=FALSE}
+n_sub <- 10000 #sample size
+
+#Sampling:
+set.seed(1234)
+ix <- lapply(labels, function(x){sample(1:length(x), n_sub)})
+
+# prepare data for Rtsne, 
+#mapply traverses over each element of datas, ix, samplID and give a list of matrix as defined in function
+data_rtsne <- mapply(function(x,y,z){
+    flowCore::exprs(x)[y,mrkrs[[z]]]
+}, x = datas, y = ix, z = samplID , SIMPLIFY = FALSE)
+
+#run Rtsne (Barnes-Hut-SNE algorithm;)
+# note initial PCA is not required, since we do not have too many dimensions
+# (i.e. not thousands, which may be the case in other domains)
+set.seed(1234)
+out_rtsne <- lapply(data_rtsne,
+                    function(x){Rtsne(x, pca = FALSE, verbose = FALSE)})
+```
+
+Function used to plot the data for each algorithm results:
+
+```{r, fig.height=7, fig.width=7}
+plot_tsne <- function(labels) {
+  for (i in 1:7) {
+    # prepare Rtsne output data for plot:
+    samp <- as.data.frame(out_rtsne[[i]]$Y)
+    colnames(samp) <- c("tSNE_1", "tSNE_2")
+    samp$Cluster <- factor(labels[[i]][ix[[i]]])
+    print(
+      ggplot(samp, aes(
+        x = tSNE_1, y = tSNE_2, color = Cluster
+      )) +
+        geom_point(size = 1) +
+        ggtitle(paste(
+          "t-SNE projection of Sample", i
+        )) +
+        theme(legend.position = "bottom") +
+        guides(color  = guide_legend(nrow = 4, byrow = TRUE))  +
+        coord_fixed(ratio = 1)
+    )
+  }
+}
+
+#Storing result of each algorithm in list to iterate for plotting
+clus_algos <- list( kmeans = clus_kmeans, Depeche = clus_depeche,
+                    flowMeans = clus_flowmeans, flowSOM_fixed = clus_fixed)
+
+#creating a r chunk for each to seperately print out results
+out = NULL
+for (i in 1:4) {
+  knit_expanded <- paste0("\n### ",names(clus_algos)[i],
+                          "\n```{r results='asis', echo=FALSE, fig.height=7, fig.width=7}",
+                          "\nplot_tsne(clus_algos[[",i,"]])\n```")
+  out = c(out, knit_expanded)
+}
+
+## <!--- knit those table chunk statements --> 
+## `r paste(knit(text = out), collapse = '\n')`
+```
+
+`r paste(knit(text = out), collapse = '\n')`
+
+## Algorithm Comparison:
+
+There can not be single best algorithm. As the factors on which an algorithm is deemed best are many like runtimes and F1 cores but algorithms tends to be good in one but perform worse in other. Same is the case in the algorithms choosen in this study.   
+
+The classic clustering method, k-Means, which has been applied to the analysis of Cytometry data, can directly group cells into clusters with a minimum within-cluster sum of squares in high-dimensional spaces. Its the most basic off-the-shelf type algorithm, so its results are not prolific but are treated as benchmark for others.   
+
+Depeche and flowMeans are the two other algorithms which are based on k-means. Depeche is based on tuning penalty by resampling dataset and is penalized form of kmeans clustering, while in flowMeans number of clusters are estimated by peak numbers of kernel density, it  uses a change point detection algorithm to determine the number of sub-populations. Both have their merits and demerits, flowMeans is time consuming and needs additional computational resources while depeche underestimates the number of clusters by combining the subpopulations. But both can be optimized by intensive parameterization tuning.  
+
+FlowSOM has an upper hand because it is as quick as depeche and also gives similar scores. It also gives flexibility to choose the number of clusters. FlowSOM, gives more precise and coherent clustering results than other approaches.
+The only limitation is we need to know the number of cluster beforehand. Predetermining the number of clusters would be difficult for exploratory experiments, where even a rough estimation of cell-type diversity is hardly available. Although FlowSOM provides an alternative option to automatically estimate the number of clusters within a given range, but this automatic estimation worsens the performance of FlowSOM. Furthermore, even if a large estimate range  is provided, FlowSOM consistently selects a small number of clusters (similar to depeche). So default setting
+(inputting a predetermined number of clusters) is the optimal setting for FlowSOM.
+
+### Runtimes:
+
+All methods were run on x-64 based laptop with Intel Core i3-4010U CPU @ 1.70GHz, 2 Cores, 4 logical processors and 8 GB of RAM. `Depeche` R implementation handles parallel processing internally in which each sample was executed parallelly at a time on 3 logical processors while `k-means`, `flowMeans`, `flowSOM` were parallelized using `doParallel` and `foreach` R packages, in which each processor executed different samples at a time. So basically only `depecheR` was the only method which ran parallelly for a sample. Timings units are in minutes.
+
+```{r}
+timings <- data.frame(
+  "Sample" = c(1:7),
+  "kmeans" = unlist(lapply(kmeans_int, function(x) {
+      x[[2]]
+    })),
+  "depeche" = unlist(lapply(depeche_int, function(x) {
+      x[[2]]
+    })),
+  "flowMeans" = unlist(lapply(flowmeans_int, function(x){
+      as.numeric(x[[2]],units = "mins")
+    })),
+  "flowSOM_fixed" = mapply(function(x,y){
+    as.numeric(x[[2]],units = "mins") + as.numeric(y[[2]],units = "mins")},
+                           x= def_res_flowsom, y = fixed_res_flowsom)  
+  )
+knitr::kable(timings)
+```
+
+### Scores
+
+```{r,fig.height=6, fig.width=7}
+#Combining scores of all samples by every algorithm 
+scores <- bind_rows(list(kmeans = as.data.frame(scores_kmeans),
+               depeche = as.data.frame(scores_depeche),
+               flowMeans = as.data.frame(scores_flowMeans),
+               flowSOM_fixed = as.data.frame(scores_flowSOM_40)), .id = 'Algorithm')
+
+timings %>% 
+  pivot_longer(cols = 2:5, names_to = "Algorithm", values_to = "Runtime") %>% 
+  full_join(pivot_longer(scores, cols = 3:5, names_to = "Measure", values_to = "Value"),
+            by = c("Sample","Algorithm")) %>%
+  ggplot(aes(x = Value, y = Runtime, color = Algorithm )) + 
+  geom_point() +
+  facet_grid(vars(Measure), vars(Sample)) + 
+  theme(legend.position = "bottom") + 
+  scale_x_continuous(n.breaks = 3)
+```
+
+## Appendix: {#Appendix}
+
+### Helper Function for evaluations:
+
+```{r, eval=FALSE}
+helper_eval <- function(clus_truth, clus_algorithm) {
+  tbl_algorithm_comb <- lapply(clus_algorithm, FUN = table)
+  tbl_truth_comb <- lapply(clus_truth, FUN = table)
+  
+  #scores
+  scores <- matrix(0, nrow = 7, ncol = 3)
+  
+  if (length(clus_algorithm) != length(clus_truth)) warning("lengths are not equal")
+  
+  for (s in c(1:length(clus_algorithm))) {
+    tbl_algorithm <- tbl_algorithm_comb[[s]]
+    tbl_truth <- tbl_truth_comb[[s]]
+    pr_mat <- re_mat <- F1_mat <- matrix( NA, 
+                                          nrow = length(tbl_algorithm), 
+                                          ncol = length(tbl_truth))
+    for (i in 1:length(tbl_algorithm)) {
+      for (j in 1:length(tbl_truth)) {
+        # cluster number from algorithm:
+        i_int <- as.integer(names(tbl_algorithm))[i]  
+        # cluster number from true labels:
+        j_int <- as.integer(names(tbl_truth))[j]  
+        
+        true_positives <- 
+          sum(clus_algorithm[[s]] == i_int & clus_truth[[s]] == j_int,
+              na.rm = TRUE)
+        detected <- sum(clus_algorithm[[s]] == i_int, na.rm = TRUE)
+        truth <- sum(clus_truth[[s]] == j_int, na.rm = TRUE)
+        
+        # calculate precision, recall, and F1 score
+        precision_ij <- true_positives / detected
+        recall_ij <- true_positives / truth
+        F1_ij <- 2 * (precision_ij * recall_ij) / (precision_ij + recall_ij)
+        
+        if (F1_ij == "NaN") F1_ij <- 0
+        
+        pr_mat[i, j] <- precision_ij
+        re_mat[i, j] <- recall_ij
+        F1_mat[i, j] <- F1_ij
+      }
+    }
+    
+    rownames(pr_mat) <- rownames(re_mat) <- rownames(F1_mat) <- names(tbl_algorithm)
+    colnames(pr_mat) <- colnames(re_mat) <- colnames(F1_mat) <- names(tbl_truth)
+    
+    # match labels using Hungarian algorithm applied to matrix of F1 scores
+    #(Hungarian algorithm calculates an optimal one-to-one assignment)
+    
+    # use transpose matrix (Hungarian algorithm assumes n_rows <= n_cols)
+    F1_mat_trans <- t(F1_mat)
+    
+    if (nrow(F1_mat_trans) <= ncol(F1_mat_trans)) {
+      # if fewer (or equal no.) true populations than detected clusters, can match all true populations
+      labels_matched <- clue::solve_LSAP(F1_mat_trans, maximum = TRUE)
+      # use row and column names since some labels may have been removed due to unassigned cells
+      labels_matched <-
+        as.numeric(colnames(F1_mat_trans)[as.numeric(labels_matched)])
+      names(labels_matched) <- rownames(F1_mat_trans)
+      
+    } else {
+      # if fewer detected clusters than true populations, use transpose matrix 
+      # and assign NAs for true populations without any matching clusters
+      labels_matched_flipped <- clue::solve_LSAP(F1_mat, maximum = TRUE)
+      # use row and column names since some labels may have been removed due to unassigned cells
+      labels_matched_flipped <-
+        as.numeric(rownames(F1_mat_trans)[as.numeric(labels_matched_flipped)])
+      names(labels_matched_flipped) <- rownames(F1_mat)
+      
+      labels_matched <- rep(NA, ncol(F1_mat))
+      names(labels_matched) <- rownames(F1_mat_trans)
+      labels_matched[as.character(labels_matched_flipped)] <-
+        as.numeric(names(labels_matched_flipped))
+    }
+    
+    # precision, recall, F1 score, and number of cells for each matched cluster
+    pr <- re <- F1 <- n_cells_matched <- rep(NA, ncol(F1_mat))
+    names(pr) <- names(re) <- names(F1) <- names(n_cells_matched) <-
+      names(labels_matched)
+    
+    for (i in 1:ncol(F1_mat)) {
+      # set to 0 if no matching cluster (too few detected clusters)
+      # use character names for row and column indices in case subsampling completely removes some clusters
+      pr[i] <- ifelse(is.na(labels_matched[i]), 
+                      0, 
+                      pr_mat[as.character(labels_matched[i]),
+                             names(labels_matched)[i]])
+      re[i] <- ifelse(is.na(labels_matched[i]),
+                      0,
+                      re_mat[as.character(labels_matched[i]),
+                             names(labels_matched)[i]])
+      F1[i] <- ifelse(is.na(labels_matched[i]),
+                      0,
+                      F1_mat[as.character(labels_matched[i]),
+                             names(labels_matched)[i]])
+      
+      n_cells_matched[i] <- sum(clus_algorithm[[s]] == labels_matched[i],
+                                na.rm = TRUE)
+    }
+    
+    # means across populations
+    scores[s,] <- c(mean(pr),mean(re),mean(F1))
+    
+  }
+  colnames(scores) <- c("Precision","Recall", "F1")
+  return(scores)
+}
+
+```
+
+
+### Modified flowMeans: {#flowMeansMy}
+
+```{r, eval=FALSE}
+flowmeansMy <- function (x, varNames = NULL, MaxN = NA, NumC = NA, iter.max = 50, 
+          nstart = 10, Mahalanobis = TRUE, Standardize = TRUE, Update = "Mahalanobis", 
+          OrthagonalResiduals = TRUE, MaxCovN = NA, MaxKernN = NA, 
+          addNoise = TRUE) 
+{
+  if (is(x, "flowFrame")) {
+    if (length(varNames) == 0) {
+      y <- exprs(x)
+      varNames <- colnames(y)
+    }
+    else {
+      y <- as.matrix(exprs(x)[, varNames])
+    }
+  }
+  else if (is(x, "matrix")) {
+    if (length(varNames) == 0) {
+      y <- x
+      if (length(colnames(x)) == 0) 
+        varNames <- "Not Available"
+      else varNames <- colnames(x)
+    }
+    else {
+      y <- as.matrix(x[, varNames])
+    }
+  }
+  else if (is(x, "data.frame")) {
+    if (length(varNames) == 0) {
+      y <- as.matrix(x)
+      varNames <- colnames(x)
+    }
+    else {
+      y <- as.matrix(x[, varNames])
+    }
+  }
+  else if (is(x, "vector")) {
+    y <- matrix(x)
+    if (length(varNames) == 0) 
+      varNames <- "Not Available"
+  }
+  else {
+    stop(paste("Object ", as.character(x), " is not of class flowFrame / matrix / data frame!"))
+  }
+  x <- y
+  if (length(is.finite(x)) != length(x)) 
+    stop("One or more of the values in 'x' are not finite (i.e., are NaN, NA, Inf, or -Inf")
+  if (addNoise) {
+    set.seed(546)
+    nfactor = 0.05
+    x = x + runif(length(x), nfactor * -1, nfactor)
+  }
+  if (Standardize) {
+    for (i in 1:length(x[1, ])) {
+      x[, i] <- x[, i] - min(x[, i])
+      x[, i] <- x[, i]/max(x[, i])
+    }
+  }
+  if (Update == "Mahalanobis") {
+    if (!Mahalanobis) 
+      Update = "Mean"
+  }
+  if (is.na(MaxKernN)) {
+    MaxKernN <- length(x[, 1])
+  }
+  if (is.na(MaxCovN)) {
+    MaxCovN <- length(x[, 1])
+  }
+  if (is.na(MaxN)) {
+    MaxN <- 0
+    for (i in 1:length(x[1, ])) MaxN <- (MaxN + countModes(x[1:MaxKernN, 
+                                                             i])$NumberOfModes)
+    MaxN <- max(MaxN, 3)
+  }
+  if (!is.na(NumC)) {
+    if (MaxN < NumC) 
+      MaxN = NumC + 10
+  }
+  km <- kmeans(x, MaxN, iter.max = iter.max, nstart = nstart,
+               #### Modification ####
+               algorithm="MacQueen")
+               ######################
+  Label <- km$cluster
+  mat <- distanceMatrix(x, Label, Mahalanobis, MaxCovN)
+  Max <- max(mat)
+  Mins <- vector()
+  Mats <- list()
+  N <- max(Label)
+  Labels <- list()
+  Mats[[1]] <- mat
+  Labels[[1]] <- Label
+  MergedClusters <- list()
+  ListOfLabels <- c(1:MaxN)
+  for (i in 1:MaxN) MergedClusters[[i]] <- c(i)
+  while (max(Label) > 1) {
+    if (!is.na(NumC)) 
+      if (max(Label) <= NumC) {
+        Min = min(mat)
+        break
+      }
+    Min <- Max * 2
+    I <- 0
+    J <- 0
+    TI <- 0
+    TJ <- 0
+    if (Update == "None") {
+      temp <- nextMerge(mat, MergedClusters)
+      Min <- temp$Min
+      TI <- temp$I
+      TJ <- temp$J
+      MergedClusters <- updateMergedClusters(TI, TJ, MergedClusters)
+      I <- ListOfLabels[TI]
+      J <- ListOfLabels[TJ]
+    }
+    else {
+      for (i in 1:N) {
+        for (j in 1:i) {
+          if (i == j) 
+            next
+          ij <- min(mat[i, j], mat[j, i])
+          if (ij < Min) {
+            Min = ij
+            I <- i
+            J <- j
+          }
+        }
+      }
+      TI = I
+      TJ = J
+    }
+    Mins[MaxN - N + 1] <- Min
+    temp <- MergeLabels(Label, ListOfLabels, I, J, TI, TJ)
+    Label <- temp$Label
+    ListOfLabels <- temp$ListOfLabels
+    N <- max(Label)
+    if (Update == "Mahalanobis") 
+      mat = distanceMatrix(x, Label, Mahalanobis, MaxCovN)
+    if (Update == "Mean") 
+      mat = MergeMatrix(mat, I, J)
+    Labels[[MaxN - N + 1]] <- Label
+    Mats[[MaxN - N + 1]] <- mat
+  }
+  Mins[MaxN - N + 1] <- Min
+  Line1 = lm(1 ~ 1)
+  Line2 = lm(1 ~ 1)
+  if (is.na(NumC)) {
+    temp <- changepointDetection(Mins, OrthagonalResiduals = OrthagonalResiduals)
+    Line1 <- temp$l1
+    Line2 <- temp$l2
+    MinIndex <- MaxN - temp$MinIndex
+    Label <- Labels[[MaxN - MinIndex + 1]]
+  }
+  if (!is.na(NumC)) {
+    MinIndex <- NumC
+    Label <- Labels[[MaxN - MinIndex + 1]]
+  }
+  return(new("Populations", Label = Label, Labels = Labels, 
+             MinIndex = MinIndex, MaxN = MaxN, Mats = Mats, Mins = Mins, 
+             Line1 = Line1, Line2 = Line2))
+}
+```
+
